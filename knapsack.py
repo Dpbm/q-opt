@@ -1,7 +1,10 @@
+import warnings
 from typing import Dict
 from pprint import pp
 import pandas as pd
 import dimod
+
+warnings.filterwarnings('ignore')
 
 def get_qubo(items:Dict[str, float], max_weight:float) -> dimod.BinaryQuadraticModel:
     """
@@ -32,8 +35,9 @@ if __name__ == "__main__":
     print("--Knapsack problem using qubo--")
     print("items: ")
     pp(items,indent=2,width=10)
-
-    qubo = get_qubo(items,3)
+    
+    max_weight = 3
+    qubo = get_qubo(items,max_weight)
     print("\nqubo model:")
     print(qubo)
 
@@ -50,5 +54,7 @@ if __name__ == "__main__":
 
     solutions['total_weight'] = mul_weights.sum(axis=1)
 
-    print("\nSolutions:")
+
+
+    print(f"\nSolutions (max weight = {max_weight}):")
     print(solutions)
