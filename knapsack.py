@@ -29,7 +29,7 @@ if __name__ == "__main__":
         "apple": 0.1
     }
 
-    print("--Knapsack proble using qubo--")
+    print("--Knapsack problem using qubo--")
     print("items: ")
     pp(items,indent=2,width=10)
 
