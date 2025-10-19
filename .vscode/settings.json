@@ -1,0 +1,18 @@
+{
+    "cSpell.words": [
+        "malloc",
+        "Memcpy",
+        "nullptr",
+        "Qubo"
+    ],
+    "files.associations": {
+        ".sequelizerc": "javascript",
+        ".stylelintrc": "json",
+        ".prettierrc": "json",
+        "*.tsx": "typescriptreact",
+        "*.yml": "yaml",
+        "bitset": "cpp",
+        "set": "cpp",
+        "format": "cpp"
+    }
+}
