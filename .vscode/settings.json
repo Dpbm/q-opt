@@ -3,6 +3,7 @@
         "malloc",
         "Memcpy",
         "nullptr",
+        "qubo",
         "Qubo"
     ],
     "files.associations": {

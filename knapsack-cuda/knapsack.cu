@@ -6,90 +6,35 @@
 
 #define NUM_ITEMS 5
 #define MAX_WEIGHT 3.0
+#define MAX_ITEMS 2.0
+#define ITEMS {2.0, 0.6, 0.5, 0.3, 0.1}
+
+// arbitrary values for penalty
+#define P1 2
+#define P2 10
+
+#define MAX_THREADS_PER_BLOCK 1024
 
 using namespace std;
 
-__constant__ float itemsGPU[NUM_ITEMS][NUM_ITEMS];
-const float itemsCPU[NUM_ITEMS][NUM_ITEMS] = {
-    {2.0, 2.6, 2.5, 2.3, 2.1}, // laptop
-    {0.0, 0.6, 1.1, 0.9, 0.7}, // notebook
-    {0.0, 0.0, 0.5, 0.8, 0.6}, // book
-    {0.0, 0.0, 0.0, 0.3, 0.4}, // umbrella
-    {0.0, 0.0, 0.0, 0.0, 0.1}, // apple
-};
-
-__constant__ float* slacksGPU;
-
-namespace Visualizer{
-    template <typename T>
-    __global__ void show_matrix(T** x, size_t rows, size_t cols){
-        printf("====COMPLETE MATRIX====\n");
-        for(size_t i = 0; i < rows; i++){
-            for(size_t j = 0; j < cols; j++){
-                printf("%d ", x[i][j]);
-            }
-            printf("\n");
-        }
-    }
-
-    __global__ void show_output(float* outputs, size_t len){
-        printf("====OUTPUTS ARRAY====\n");
-        for(size_t i = 0; i < len; i++){
-            printf("%f ",outputs[i]);
-        }
-        printf("\n");
-
-    }
-
-};
-    
-
-__device__ void get_binary_value(u_int8_t* values, int value, u_int8_t size){
-    for(size_t i = 0; i < size; i++){
-        int bin_index = size-1-i;
-        int bin_converted = pow(2,bin_index);
-
-        int updated_value = value - bin_converted;
-
-        if(updated_value >= 0){
-            value -= bin_converted;
-            values[i] = (u_int8_t)1;
-        }else{
-            values[i] = (u_int8_t)0;
-        }
-    }
-}
-
-__global__ void generate_x_vector(u_int8_t** x, size_t size){
-    get_binary_value(x[threadIdx.x], threadIdx.x, size);
-} 
 
 
-__global__ void apply_ops(u_int8_t** x, float* outputs){
-    float tempData[NUM_ITEMS];
-    for(size_t i = 0; i < NUM_ITEMS; i++){
-        for(size_t j = 0; j < NUM_ITEMS; j++){
-            tempData[i] += itemsGPU[j][i] * (float)x[threadIdx.x][j];
-        }
-    }
-    for(size_t i = 0; i < NUM_ITEMS; i++){
-        outputs[threadIdx.x] += tempData[i] * (float)x[threadIdx.x][i];
-    }
-}
+__constant__ float itemsGPU[NUM_ITEMS] = ITEMS;
+const float itemsCPU[NUM_ITEMS] = ITEMS;
 
 
-__host__ size_t calculate_slack_vars(){
+__device__ float* slacksGPU;
+__host__ void calculate_slack_vars(vector<float> &slacks_weights, size_t* amount_of_slacks){
     printf("-=-=-=-=-=-Calculating Slack variables-=-=-=-=-=-=-=-=-\n");
 
     size_t amount = 0;
     map<float,bool> mapped_diffs;
-    vector<float> slacks_weights;
 
     for(size_t i = 0; i < NUM_ITEMS; i++){
         for(size_t j = 0; j < NUM_ITEMS; j++){
             if(i == j) continue;
 
-            float diff = MAX_WEIGHT - (itemsCPU[i][i] + itemsCPU[j][j]);
+            float diff = MAX_WEIGHT - (itemsCPU[i] + itemsCPU[j]);
             
             if(diff == 0 || mapped_diffs[diff]) continue;
 
@@ -102,81 +47,172 @@ __host__ size_t calculate_slack_vars(){
         }
     }
 
-    size_t size_slacks_bytes = amount * sizeof(float);
-    float* slacks = (float*)malloc(size_slacks_bytes);
-    for(size_t i = 0; i < amount; i++)
-        slacks[i] = slacks_weights.at(i);
+    *amount_of_slacks = amount;
 
-    printf("Copied into GPU memory\n");
-    cudaMemcpyToSymbol(slacksGPU, slacks, size_slacks_bytes);
-
-    free(slacks);
-
-    return amount;
 }
 
+
+__device__ float* qubo;
+__device__ float* penalty_weight;
+__device__ float* penalty_amount;
+__global__ void eval_qubo(size_t max, size_t total_bits, size_t total_slacks, int threads_y){
+    int index = (blockIdx.x*threads_y)+threadIdx.y;
+    if(index >= max){
+        return;
+    }
+
+    int bit_index = total_bits - threadIdx.x - 1;
+    int bin_to_dec = index;
+    bool is_one = (bin_to_dec >> bit_index)%2 == 1;
+    
+    int value = 0;
+    int penalty_1 = 0;
+    int penalty_2 = 0;
+    
+
+    if(is_one){
+        int max_var_index = total_bits-total_slacks-1;
+
+        if(bit_index <= max_var_index){
+            value += itemsGPU[bit_index];
+            penalty_2 += itemsGPU[bit_index];
+        }else{
+            int slack_index = bit_index-max_var_index;
+            penalty_2 += slacksGPU[slack_index];
+        }
+
+
+        penalty_1 = 1;
+    }
+
+    size_t mem_index = index;
+    qubo[mem_index] += value;
+    penalty_amount[mem_index] += penalty_1;
+    penalty_weight[mem_index] += penalty_2;
+
+}
+
+__global__ void sum_up_values(size_t max){
+    int index = (blockIdx.x*MAX_THREADS_PER_BLOCK)+threadIdx.x;
+    if(index >= max) return;
+
+    printf("%ld = %f %f %f\n", index, qubo[index], penalty_amount[index], penalty_weight[index]);
+    
+    qubo[index] += P1*pow((penalty_amount[index] - MAX_ITEMS),2) + P2*pow((penalty_weight[index] - MAX_WEIGHT), 2);
+}
+
+__global__ void show_values(size_t size){
+    for(size_t i = 0; i < size; i++){
+        printf("%ld = %f \n", i, qubo[i]);
+    }
+}
 
 int main(){ 
     printf("Qubo with CUDA for KNAPSACK of two items\n");
     
-    size_t amount_of_slack = calculate_slack_vars();
+    vector<float> slacks_weights;
+    size_t amount_of_slacks;
+    calculate_slack_vars(slacks_weights, &amount_of_slacks);
 
-    u_int8_t total_bits = 6;
-    u_int8_t total_threads = pow(2,total_bits);
+    size_t size_slacks_bytes = amount_of_slacks * sizeof(float);
+    float* slacks = (float*)malloc(size_slacks_bytes);
+    for(size_t i = 0; i < amount_of_slacks; i++)
+        slacks[i] = slacks_weights.at(i);
 
-    size_t bytes_size_matrix = total_threads*(sizeof(u_int8_t*));
-    size_t bytes_size_row = total_bits*(sizeof(u_int8_t));
-
-    cudaMemcpyToSymbol(itemsGPU, itemsCPU, NUM_ITEMS*NUM_ITEMS*sizeof(float));
-
-    u_int8_t** gpu_x;
-    cudaError_t status =  cudaMalloc(&gpu_x, bytes_size_matrix);
+    float* gpu_slacks_temp;
+    auto status = cudaMalloc(&gpu_slacks_temp, size_slacks_bytes);
     if(status != cudaSuccess){
-        printf("Failed on allocate matrix on gpu!");
+        printf("Failed on allocate memory on GPU\n");
         return 1;
     }
 
-    u_int8_t** host_x = (u_int8_t**)malloc(bytes_size_matrix);
-    if(host_x == nullptr){
-        printf("Failed on allocate host matrix!");
-        return 1;
-    }
-
-    for(size_t i = 0; i < total_threads; i++){
-        status = cudaMalloc(&host_x[i], bytes_size_row);
-        if(status != cudaSuccess){
-            printf("Failed on allocate matrix rows on gpu!");
-            return 1;
-        }
-    }
-
-    float* outputs;
-    status = cudaMalloc(&outputs, total_threads*sizeof(float));
+    status = cudaMemcpy(gpu_slacks_temp, slacks, size_slacks_bytes, cudaMemcpyHostToDevice);
     if(status != cudaSuccess){
-        printf("Failed on allocate outputs array on gpu!");
+        printf("Failed on copy data to GPU\n");
+        return 1;
+    }
+    
+    status = cudaMemcpyToSymbol(slacksGPU, &gpu_slacks_temp, sizeof(float*));
+    if(status != cudaSuccess){
+        printf("Failed on copy symbol to gpu\n");
         return 1;
     }
 
-    cudaMemcpy(gpu_x,host_x,bytes_size_matrix, cudaMemcpyHostToDevice);
 
-    generate_x_vector<<<1, total_threads>>>(gpu_x, total_bits);
+
+    size_t total_bits = NUM_ITEMS + amount_of_slacks;
+    size_t amount_of_computations = pow(2,total_bits);
+
+
+    int threads_y = floor(MAX_THREADS_PER_BLOCK/total_bits);
+    dim3 threads_dim_eval(total_bits, threads_y, 1);
+    dim3 blocks_dim_eval(ceil(amount_of_computations/threads_y),1,1);
+
+
+    dim3 threads_dim_sum(MAX_THREADS_PER_BLOCK,1,1);
+    dim3 blocks_dim_sum(ceil(amount_of_computations/MAX_THREADS_PER_BLOCK),1,1);
+
+    size_t values_array_size = amount_of_computations*sizeof(float);
+        
+    
+    float* local_qubo;
+    float* local_penalty1;
+    float* local_penalty2;
+
+    status = cudaMalloc(&local_qubo, values_array_size);
+    if(status != cudaSuccess){
+        printf("Failed on allocate memory for qubo\n");
+        return 1;
+    }
+    
+    status = cudaMalloc(&local_penalty1, values_array_size);
+    if(status != cudaSuccess){
+        printf("Failed on allocate memory for amount penalty\n");
+        return 1;
+    }
+    
+    status = cudaMalloc(&local_penalty2, values_array_size);
+    if(status != cudaSuccess){
+        printf("Failed on allocate memory for weight penalty\n");
+        return 1;
+    }
+
+
+    status = cudaMemcpyToSymbol(qubo, &local_qubo, sizeof(float*));
+    if(status != cudaSuccess){
+        printf("Failed on copy qubo symbol to gpu\n");
+        return 1;
+    }
+    
+    status = cudaMemcpyToSymbol(penalty_amount, &local_penalty1, sizeof(float*));
+    if(status != cudaSuccess){
+        printf("Failed on copy penalty amount symbol to gpu\n");
+        return 1;
+    }
+    
+    status = cudaMemcpyToSymbol(penalty_weight, &local_penalty2, sizeof(float*));
+    if(status != cudaSuccess){
+        printf("Failed on copy penalty weight symbol to gpu\n");
+        return 1;
+    }
+
+
+    
+    printf("-=-=-=-=-=-Evaluating-=-=-=-=-=-=-\n");
+    eval_qubo<<<blocks_dim_eval, threads_dim_eval>>>(amount_of_computations,total_bits,amount_of_slacks, threads_y);
     cudaDeviceSynchronize();
 
-    Visualizer::show_matrix<u_int8_t><<<1,1>>>(gpu_x, total_threads, total_bits);
+    sum_up_values<<<blocks_dim_sum, threads_dim_sum>>>(amount_of_computations);
     cudaDeviceSynchronize();
 
-    // apply_ops<<<1, total_threads>>>(gpu_x,outputs);
-    // cudaDeviceSynchronize();
+    show_values<<<1,1>>>(amount_of_computations);
+    cudaDeviceSynchronize();
 
-    // Visualizer::show_output<<<1,1>>>(outputs, total_threads);
-    // cudaDeviceSynchronize();
-
-
-    for(size_t i = 0; i < total_threads; i++){
-        cudaFree(host_x[i]);
-    }
-    cudaFree(host_x);
-    cudaFree(gpu_x);
+    free(slacks);
+    cudaFree(gpu_slacks_temp);
+    cudaFree(local_qubo);
+    cudaFree(local_penalty1);
+    cudaFree(local_penalty2);
 
     return 0;
 }
