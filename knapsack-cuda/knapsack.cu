@@ -10,10 +10,11 @@
 #define ITEMS {2.0, 0.6, 0.5, 0.3, 0.1}
 
 // arbitrary values for penalty
-#define P1 2
+#define P1 3
 #define P2 10
 
 #define MAX_THREADS_PER_BLOCK 1024
+#define FIND_BATCHES 1024
 
 using namespace std;
 
@@ -107,6 +108,45 @@ __global__ void show_values(size_t size){
     }
 }
 
+
+__global__ void find_options(size_t max_index, float* founds, size_t* indexes){
+    size_t base_index = threadIdx.x*FIND_BATCHES;
+
+    float smallest = 100000000000000;
+    size_t best_index = 0;
+
+    for(size_t i = 0; i < FIND_BATCHES; i++){
+        size_t new_index = base_index + i;
+        if(new_index >= max_index) break;
+        
+        if(qubo[new_index] < smallest){
+            smallest = qubo[new_index];
+            best_index = new_index;
+        }
+    }
+
+    founds[threadIdx.x] = smallest;
+    indexes[threadIdx.x] = best_index;
+}
+
+__global__ void get_the_best(size_t size, float* founds, size_t* indexes){
+    float smallest = 100000000000000;
+    size_t best_index = 0;
+
+    for(size_t i = 0; i < size; i++){
+        if(founds[i] < smallest){
+            smallest = founds[i];
+            best_index = indexes[i];
+        }
+    }
+
+    printf("BEST SOLUTION index=%ld; value=%f\n",best_index, smallest);
+
+}
+
+
+
+
 int main(){ 
     printf("Qubo with CUDA for KNAPSACK of two items\n");
     
@@ -149,8 +189,10 @@ int main(){
     dim3 blocks_dim_eval(ceil(amount_of_computations/threads_y),1,1);
 
 
+
+    int computations_per_threads = ceil(amount_of_computations/MAX_THREADS_PER_BLOCK);
     dim3 threads_dim_sum(MAX_THREADS_PER_BLOCK,1,1);
-    dim3 blocks_dim_sum(ceil(amount_of_computations/MAX_THREADS_PER_BLOCK),1,1);
+    dim3 blocks_dim_sum(computations_per_threads,1,1);
 
     size_t values_array_size = amount_of_computations*sizeof(float);
         
@@ -196,23 +238,44 @@ int main(){
         return 1;
     }
 
-
     
     printf("-=-=-=-=-=-Evaluating-=-=-=-=-=-=-\n");
     eval_qubo<<<blocks_dim_eval, threads_dim_eval>>>(amount_of_computations,total_bits,amount_of_slacks, threads_y);
     cudaDeviceSynchronize();
+    free(slacks);
+    cudaFree(gpu_slacks_temp);
 
     sum_up_values<<<blocks_dim_sum, threads_dim_sum>>>(amount_of_computations);
     cudaDeviceSynchronize();
+    cudaFree(local_penalty1);
+    cudaFree(local_penalty2);
 
     show_values<<<1,1>>>(amount_of_computations);
     cudaDeviceSynchronize();
 
-    free(slacks);
-    cudaFree(gpu_slacks_temp);
+    int total_founds = ceil(amount_of_computations/FIND_BATCHES);
+
+    float* founds;
+    size_t* indexes;
+
+    status = cudaMalloc(&founds, total_founds*sizeof(float));
+    if(status != cudaSuccess){
+        printf("Failed on allocate memory for founds elements\n");
+        return 1;
+    }
+
+
+    status = cudaMalloc(&indexes, total_founds*sizeof(size_t));
+    if(status != cudaSuccess){
+        printf("Failed on allocate memory for founds indexes\n");
+        return 1;
+    }
+
+    find_options<<<1, total_founds>>>(amount_of_computations, founds, indexes);
+    
+    get_the_best<<<1, 1>>>(total_founds, founds, indexes);
+
     cudaFree(local_qubo);
-    cudaFree(local_penalty1);
-    cudaFree(local_penalty2);
 
     return 0;
 }
