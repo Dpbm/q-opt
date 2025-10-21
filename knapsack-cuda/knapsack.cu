@@ -2,6 +2,7 @@
 #include <printf.h>
 #include <cmath>
 #include <map>
+#include <string>
 #include <vector>
 
 #define NUM_ITEMS 5
@@ -10,11 +11,11 @@
 #define ITEMS {2.0, 0.6, 0.5, 0.3, 0.1}
 
 // arbitrary values for penalty
-#define P1 3
-#define P2 10
+#define P1 20
+#define P2 2
 
 #define MAX_THREADS_PER_BLOCK 1024
-#define FIND_BATCHES 1024
+#define FIND_BATCHES 3000
 
 using namespace std;
 
@@ -23,6 +24,9 @@ using namespace std;
 __constant__ float itemsGPU[NUM_ITEMS] = ITEMS;
 const float itemsCPU[NUM_ITEMS] = ITEMS;
 
+__constant__ size_t total_bits;
+__constant__ size_t total_slacks;
+__constant__ size_t total_computation;
 
 __device__ float* slacksGPU;
 __host__ void calculate_slack_vars(vector<float> &slacks_weights, size_t* amount_of_slacks){
@@ -56,60 +60,57 @@ __host__ void calculate_slack_vars(vector<float> &slacks_weights, size_t* amount
 __device__ float* qubo;
 __device__ float* penalty_weight;
 __device__ float* penalty_amount;
-__global__ void eval_qubo(size_t max, size_t total_bits, size_t total_slacks, int threads_y){
+__global__ void eval_qubo(int threads_y){
     int index = (blockIdx.x*threads_y)+threadIdx.y;
-    if(index >= max){
+    if(index >= total_computation)
         return;
-    }
 
     int bit_index = total_bits - threadIdx.x - 1;
     int bin_to_dec = index;
     bool is_one = (bin_to_dec >> bit_index)%2 == 1;
     
-    int value = 0;
-    int penalty_1 = 0;
-    int penalty_2 = 0;
+    float value = 0;
+    float penalty_1 = 0;
+    float penalty_2 = 0;
     
 
     if(is_one){
-        int max_var_index = total_bits-total_slacks-1;
+        int max_var_index = total_slacks-1;
 
-        if(bit_index <= max_var_index){
+        if(bit_index > max_var_index){
             value += itemsGPU[bit_index];
             penalty_2 += itemsGPU[bit_index];
+            penalty_1 = 1.0;
         }else{
-            int slack_index = bit_index-max_var_index;
+            int slack_index = max_var_index-bit_index;
             penalty_2 += slacksGPU[slack_index];
         }
 
 
-        penalty_1 = 1;
     }
 
-    size_t mem_index = index;
-    qubo[mem_index] += value;
-    penalty_amount[mem_index] += penalty_1;
-    penalty_weight[mem_index] += penalty_2;
+    qubo[index] += value;
+    penalty_amount[index] += penalty_1;
+    penalty_weight[index] += penalty_2;
 
 }
 
-__global__ void sum_up_values(size_t max){
+__global__ void sum_up_values(){
     int index = (blockIdx.x*MAX_THREADS_PER_BLOCK)+threadIdx.x;
-    if(index >= max) return;
+    if(index >= total_computation) return;
 
     printf("%ld = %f %f %f\n", index, qubo[index], penalty_amount[index], penalty_weight[index]);
     
     qubo[index] += P1*pow((penalty_amount[index] - MAX_ITEMS),2) + P2*pow((penalty_weight[index] - MAX_WEIGHT), 2);
 }
 
-__global__ void show_values(size_t size){
-    for(size_t i = 0; i < size; i++){
+__global__ void show_values(){
+    for(size_t i = 0; i < total_computation; i++){
         printf("%ld = %f \n", i, qubo[i]);
     }
 }
 
-
-__global__ void find_options(size_t max_index, float* founds, size_t* indexes){
+__global__ void find_options(float* founds, size_t* indexes){
     size_t base_index = threadIdx.x*FIND_BATCHES;
 
     float smallest = 100000000000000;
@@ -117,7 +118,7 @@ __global__ void find_options(size_t max_index, float* founds, size_t* indexes){
 
     for(size_t i = 0; i < FIND_BATCHES; i++){
         size_t new_index = base_index + i;
-        if(new_index >= max_index) break;
+        if(new_index >= total_computation) break;
         
         if(qubo[new_index] < smallest){
             smallest = qubo[new_index];
@@ -129,21 +130,16 @@ __global__ void find_options(size_t max_index, float* founds, size_t* indexes){
     indexes[threadIdx.x] = best_index;
 }
 
-__global__ void get_the_best(size_t size, float* founds, size_t* indexes){
-    float smallest = 100000000000000;
-    size_t best_index = 0;
-
+__global__ void show_solutions(size_t size, float* founds, size_t* indexes){
     for(size_t i = 0; i < size; i++){
-        if(founds[i] < smallest){
-            smallest = founds[i];
-            best_index = indexes[i];
+
+        for(int j = total_bits-1; j >= 0; j--){
+            printf("%d ", (indexes[i] >> j)%2 == 1);
         }
+
+        printf(" -> index=%ld; value=%f\n",indexes[i],founds[i]);
     }
-
-    printf("BEST SOLUTION index=%ld; value=%f\n",best_index, smallest);
-
 }
-
 
 
 
@@ -160,9 +156,16 @@ int main(){
         slacks[i] = slacks_weights.at(i);
 
     float* gpu_slacks_temp;
+
     auto status = cudaMalloc(&gpu_slacks_temp, size_slacks_bytes);
     if(status != cudaSuccess){
-        printf("Failed on allocate memory on GPU\n");
+        printf("Failed on allocate memory for slacks\n");
+        return 1;
+    }
+
+    status = cudaMemcpyToSymbol(slacksGPU, &gpu_slacks_temp, sizeof(float*));
+    if(status != cudaSuccess){
+        printf("Failed on copy slacks symbol to gpu\n");
         return 1;
     }
 
@@ -171,30 +174,42 @@ int main(){
         printf("Failed on copy data to GPU\n");
         return 1;
     }
-    
-    status = cudaMemcpyToSymbol(slacksGPU, &gpu_slacks_temp, sizeof(float*));
+
+    size_t total_bits_local = NUM_ITEMS + amount_of_slacks;
+    size_t amount_of_computations_local = pow(2,total_bits_local);
+
+
+    status = cudaMemcpyToSymbol(total_bits, &total_bits_local, sizeof(size_t));
     if(status != cudaSuccess){
-        printf("Failed on copy symbol to gpu\n");
+        printf("Failed on copy total_bits symbol to gpu\n");
+        return 1;
+    }
+    
+
+    status = cudaMemcpyToSymbol(total_computation, &amount_of_computations_local, sizeof(size_t));
+    if(status != cudaSuccess){
+        printf("Failed on copy total_computation symbol to gpu\n");
+        return 1;
+    }
+
+    status = cudaMemcpyToSymbol(total_slacks, &amount_of_slacks, sizeof(size_t));
+    if(status != cudaSuccess){
+        printf("Failed on copy total_slacks symbol to gpu\n");
         return 1;
     }
 
 
-
-    size_t total_bits = NUM_ITEMS + amount_of_slacks;
-    size_t amount_of_computations = pow(2,total_bits);
-
-
-    int threads_y = floor(MAX_THREADS_PER_BLOCK/total_bits);
-    dim3 threads_dim_eval(total_bits, threads_y, 1);
-    dim3 blocks_dim_eval(ceil(amount_of_computations/threads_y),1,1);
+    int threads_y = floor(MAX_THREADS_PER_BLOCK/total_bits_local);
+    dim3 threads_dim_eval(total_bits_local, threads_y, 1);
+    dim3 blocks_dim_eval(ceil(amount_of_computations_local/threads_y),1,1);
 
 
 
-    int computations_per_threads = ceil(amount_of_computations/MAX_THREADS_PER_BLOCK);
+    int computations_per_threads = ceil(amount_of_computations_local/MAX_THREADS_PER_BLOCK);
     dim3 threads_dim_sum(MAX_THREADS_PER_BLOCK,1,1);
     dim3 blocks_dim_sum(computations_per_threads,1,1);
 
-    size_t values_array_size = amount_of_computations*sizeof(float);
+    size_t values_array_size = amount_of_computations_local*sizeof(float);
         
     
     float* local_qubo;
@@ -240,20 +255,20 @@ int main(){
 
     
     printf("-=-=-=-=-=-Evaluating-=-=-=-=-=-=-\n");
-    eval_qubo<<<blocks_dim_eval, threads_dim_eval>>>(amount_of_computations,total_bits,amount_of_slacks, threads_y);
+    eval_qubo<<<blocks_dim_eval, threads_dim_eval>>>(threads_y);
     cudaDeviceSynchronize();
     free(slacks);
     cudaFree(gpu_slacks_temp);
 
-    sum_up_values<<<blocks_dim_sum, threads_dim_sum>>>(amount_of_computations);
+    sum_up_values<<<blocks_dim_sum, threads_dim_sum>>>();
     cudaDeviceSynchronize();
     cudaFree(local_penalty1);
     cudaFree(local_penalty2);
 
-    show_values<<<1,1>>>(amount_of_computations);
-    cudaDeviceSynchronize();
+    // show_values<<<1,1>>>();
+    // cudaDeviceSynchronize();
 
-    int total_founds = ceil(amount_of_computations/FIND_BATCHES);
+    int total_founds = ceil(amount_of_computations_local/FIND_BATCHES);
 
     float* founds;
     size_t* indexes;
@@ -271,9 +286,11 @@ int main(){
         return 1;
     }
 
-    find_options<<<1, total_founds>>>(amount_of_computations, founds, indexes);
+    find_options<<<1, total_founds>>>(founds, indexes);
+    cudaDeviceSynchronize();
     
-    get_the_best<<<1, 1>>>(total_founds, founds, indexes);
+    show_solutions<<<1, 1>>>(total_founds, founds, indexes);
+    cudaDeviceSynchronize();
 
     cudaFree(local_qubo);
 
