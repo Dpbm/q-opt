@@ -6,6 +6,8 @@ This repo, contains some optimization problems I solved using some quantum compu
 
 ## HOW TO USE
 
+## For python environments
+
 first of all, install `uv`, and run:
 
 ```bash
@@ -18,6 +20,17 @@ then, you can run any script, just run:
 uv run script
 ```
 
+### For cuda environments
+
+You need to have cuda toolkit installed and then run
+
+```bash
+make
+```
+
+inside the project folder.
+
 ## Solved Problems
 
 * [knapsack](./knapsack.py)
+* [knapsack cuda qubo](./knapsack-cuda/)
